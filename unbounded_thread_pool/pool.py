@@ -16,6 +16,16 @@ class TaskItem:
     args: tuple
     kwargs: dict
 
+    def run(self):
+        try:
+            result = self.func(*self.args, **self.kwargs)
+        except BaseException as exc:
+            self.future.set_exception(exc)
+            # Break a reference cycle with the exception 'exc'
+            self = None
+        else:
+            self.future.set_result(result)
+
 
 class DieTask:
     # Used to notify Worker that it should exit
@@ -46,8 +56,7 @@ class _WorkerThread(_PoolThead):
                     elif not task.future.set_running_or_notify_cancel():
                         continue
                     else:
-                        result = task.func(*task.args, **task.kwargs)
-                        task.future.set_result(result)
+                        task.run()
         finally:
             self.executor.active_count -= 1
             logger.info(f'WorkerThread {self.name} shutting down')

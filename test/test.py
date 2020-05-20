@@ -35,6 +35,14 @@ class UnboundPoolTests(TestCase):
         future = self.executor.submit(func)
         self.assertTrue(future.result(), 42)
 
+    def test_exception_is_propogated(self):
+        def func():
+            raise KeyError
+
+        future = self.executor.submit(func)
+        with self.assertRaises(KeyError):
+            future.result()
+
     def test_executor_passes_parameters(self):
         passed_args = None
         passed_kwargs = None
