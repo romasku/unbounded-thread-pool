@@ -1,6 +1,8 @@
+import atexit
 import logging
 import queue
 import threading
+import weakref
 from concurrent.futures import Executor, Future
 from dataclasses import dataclass
 from threading import Thread
@@ -47,7 +49,7 @@ class DieTask:
 class _WorkerThread(Thread):
 
     def __init__(self, name: str, pool_state: PoolState):
-        super().__init__(name=name)
+        super().__init__(name=name, daemon=True)
         self.pool_state = pool_state
 
     class StopException(Exception):
@@ -83,7 +85,7 @@ class _ResurrectorThread(Thread):
     threads: List[_WorkerThread]
 
     def __init__(self, name: str, pool_state: PoolState):
-        super().__init__(name=name)
+        super().__init__(name=name, daemon=True)
         self._worker_threads_id = 1
         self.threads = []
         self.pool_state = pool_state
@@ -113,6 +115,12 @@ class _ResurrectorThread(Thread):
         logger.info(f'ResurrectorThread {self.name} shutting down')
 
 
+def _atexit_handler(executor_ref):
+    executor = executor_ref()
+    if executor and not executor.state.shutting_down:
+        executor.shutdown(wait=True)
+
+
 class UnboundedThreadPoolExecutor(Executor):
     state: PoolState
     _resurrector_thread: _ResurrectorThread
@@ -131,6 +139,8 @@ class UnboundedThreadPoolExecutor(Executor):
         )
         self._resurrector_thread.start()
         self._shutdown_lock = threading.Lock()
+
+        atexit.register(_atexit_handler, weakref.ref(self))
 
     def submit(*args, **kwargs):
         # Copy-pasted from concurrent.futures.thread.ThreadPoolExecutor

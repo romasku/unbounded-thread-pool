@@ -153,7 +153,6 @@ class UnboundPoolTests(TestCase):
         initial_count = threading.active_count()
 
         def func():
-            print('executing')
             time.sleep(_EPSILON)
             return 42
 
