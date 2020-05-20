@@ -116,6 +116,7 @@ class _ResurrectorThread(Thread):
 class UnboundedThreadPoolExecutor(Executor):
     state: PoolState
     _resurrector_thread: _ResurrectorThread
+    _shutdown_lock: threading.Lock
 
     def __init__(self, name: str = 'UnboundedThreadPoolExecutor', max_thread_idle_time: float = 30):
         self.state = PoolState(
@@ -129,6 +130,7 @@ class UnboundedThreadPoolExecutor(Executor):
             pool_state=self.state,
         )
         self._resurrector_thread.start()
+        self._shutdown_lock = threading.Lock()
 
     def submit(*args, **kwargs):
         # Copy-pasted from concurrent.futures.thread.ThreadPoolExecutor
@@ -147,18 +149,25 @@ class UnboundedThreadPoolExecutor(Executor):
         else:
             raise TypeError('submit expected at least 1 positional argument, '
                             'got %d' % (len(args) - 1))
-        future = Future()
-        self.state.queue.put(TaskItem(future, fn, args, kwargs))
-        self.state.resurrector_event.set()
-        return future
+        with self._shutdown_lock:
+            if self.state.shutting_down:
+                raise RuntimeError('cannot schedule new futures after shutdown')
+            future = Future()
+            self.state.queue.put(TaskItem(future, fn, args, kwargs))
+            self.state.resurrector_event.set()
+            return future
 
     def __del__(self):
-        self.shutdown(wait=False)
-
-    def shutdown(self, wait=True):
+        # If there is no reference, there can be no race with .submit call
         self.state.shutting_down = True
         self.state.queue.put(DieTask)
         self.state.resurrector_event.set()
+
+    def shutdown(self, wait=True):
+        with self._shutdown_lock:
+            self.state.shutting_down = True
+            self.state.queue.put(DieTask)
+            self.state.resurrector_event.set()
 
         if wait:
             self._resurrector_thread.join()

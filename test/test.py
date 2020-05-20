@@ -87,6 +87,28 @@ class UnboundPoolTests(TestCase):
                 future.result()
                 called = False
 
+    def test_cannot_submit_after_shutdown(self):
+        def func():
+            pass
+
+        executor = pool.UnboundedThreadPoolExecutor(max_thread_idle_time=0.2)
+        executor.shutdown(wait=False)
+        with self.assertRaises(RuntimeError):
+            executor.submit(func)
+
+    def test_race_condition_between_submit_and_shutdown(self):
+        def func():
+            return 42
+        for _ in range(10):
+            executor = pool.UnboundedThreadPoolExecutor(max_thread_idle_time=0.2)
+            self.executor.submit(executor.shutdown)
+            outer_future = self.executor.submit(executor.submit, func)
+            # Should either produce result or raise runtime error, but never hang
+            try:
+                self.assertEqual(outer_future.result().result(timeout=0.1), 42)
+            except RuntimeError:
+                pass
+
     def test_all_thread_are_destroyed_after_max_thread_idle_time(self):
 
         def noop():
