@@ -127,6 +127,24 @@ class UnboundPoolTests(TestCase):
 
         self.assertEqual(initial_count, threading.active_count())
 
+    def test_all_thread_are_destroyed_if_no_refence_to_pool(self):
+        initial_count = threading.active_count()
+
+        def func():
+            print('executing')
+            time.sleep(_EPSILON)
+            return 42
+
+        executor = pool.UnboundedThreadPoolExecutor(max_thread_idle_time=30)
+        futures = [executor.submit(func) for _ in range(10)]
+        del executor  # Delete reference
+
+        for future in futures:
+            self.assertEqual(future.result(), 42)  # All pending futures processed normally
+
+        time.sleep(0.2)  # Allow threadpool to do cleanup
+        self.assertEqual(initial_count, threading.active_count())
+
     def test_race_condition_of_thread_cleaning_and_task_submition(self):
         time_delta = 0.2
         iterations = 10

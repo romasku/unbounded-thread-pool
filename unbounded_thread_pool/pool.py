@@ -4,9 +4,21 @@ import threading
 from concurrent.futures import Executor, Future
 from dataclasses import dataclass
 from threading import Thread
-from typing import Callable, Union, Type
+from typing import Callable, Union, Type, List
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PoolState:
+    # Special class to hold all Poll data. It is safe to have strong reference on it
+    max_thread_idle_time: float
+    name: str
+
+    queue: "queue.Queue[Union[Type[DieTask], TaskItem]]"
+    resurrector_event: threading.Event
+    shutting_down: bool = False
+    die_task_reached: bool = False
 
 
 @dataclass
@@ -32,57 +44,59 @@ class DieTask:
     pass
 
 
-class _PoolThead(Thread):
+class _WorkerThread(Thread):
 
-    def __init__(self, name: str, executor: 'UnboundedThreadPoolExecutor'):
+    def __init__(self, name: str, pool_state: PoolState):
         super().__init__(name=name)
-        self.executor = executor
+        self.pool_state = pool_state
 
+    class StopException(Exception):
+        pass
 
-class _WorkerThread(_PoolThead):
+    def main_loop(self):
+        try:
+            task = self.pool_state.queue.get(timeout=self.pool_state.max_thread_idle_time)
+        except queue.Empty:
+            raise self.StopException()  # We were idle for `max_thread_idle_time`, so we should exit now
+        else:
+            if task is DieTask:
+                self.pool_state.queue.put(task)
+                self.pool_state.die_task_reached = True
+                raise self.StopException()
+            elif task.future.set_running_or_notify_cancel():
+                task.run()
 
     def run(self) -> None:
         logger.info(f'WorkerThread {self.name} starting')
         try:
-            self.executor.active_count += 1
             while True:
-                try:
-                    task = self.executor._queue.get(timeout=self.executor.max_thread_idle_time)
-                except queue.Empty:
-                    return  # We were idle for `max_thread_idle_time`, so we should exit now
-                else:
-                    if task is DieTask:
-                        return
-                    elif not task.future.set_running_or_notify_cancel():
-                        continue
-                    else:
-                        task.run()
-        finally:
-            self.executor.active_count -= 1
+                self.main_loop()
+        except self.StopException:
             logger.info(f'WorkerThread {self.name} shutting down')
 
 
-class _ResurrectorThread(_PoolThead):
+class _ResurrectorThread(Thread):
     base_timeout = 0.01
     max_timeout = 2
 
-    _worker_threads_id = 1
-    threads = []
+    _worker_threads_id: int
+    threads: List[_WorkerThread]
 
-    def __init__(self, name: str, executor: 'UnboundedThreadPoolExecutor'):
-        super().__init__(name=name, executor=executor)
+    def __init__(self, name: str, pool_state: PoolState):
+        super().__init__(name=name)
         self._worker_threads_id = 1
         self.threads = []
+        self.pool_state = pool_state
 
     def run(self) -> None:
         logger.info(f'ResurrectorThread {self.name} starting')
         timeout = self.base_timeout
-        while not self.executor._shutting_down:
-            if not self.executor._queue.empty():
+        while not self.pool_state.die_task_reached:
+            if not self.pool_state.queue.empty():
                 # This means that there are more tasks then workers
                 worker_thread = _WorkerThread(
-                    name=f'{self.executor.name}WorkerThread {self._worker_threads_id}',
-                    executor=self.executor,
+                    name=f'{self.pool_state.name}WorkerThread {self._worker_threads_id}',
+                    pool_state=self.pool_state,
                 )
                 self.threads.append(worker_thread)
                 worker_thread.start()
@@ -90,8 +104,9 @@ class _ResurrectorThread(_PoolThead):
                 timeout = self.base_timeout
             else:
                 timeout = min(timeout * 2, self.max_timeout)
-            if self.executor._resurrector_event.wait(timeout=timeout):
-                self.executor._resurrector_event.clear()
+
+            if self.pool_state.resurrector_event.wait(timeout=timeout):
+                self.pool_state.resurrector_event.clear()
 
         for thread in self.threads:
             thread.join()
@@ -99,22 +114,19 @@ class _ResurrectorThread(_PoolThead):
 
 
 class UnboundedThreadPoolExecutor(Executor):
-    active_count: int = 0
-    max_thread_idle_time: float
-    name: str
-
-    _queue: "queue.Queue[Union[Type[DieTask], TaskItem]]"
-    _shutting_down: bool = False
-    _resurrector_event: threading.Event
+    state: PoolState
+    _resurrector_thread: _ResurrectorThread
 
     def __init__(self, name: str = 'UnboundedThreadPoolExecutor', max_thread_idle_time: float = 30):
-        self.name = name
-        self.max_thread_idle_time = max_thread_idle_time
-        self._queue = queue.Queue()
-        self._resurrector_event = threading.Event()
+        self.state = PoolState(
+            name=name,
+            max_thread_idle_time=max_thread_idle_time,
+            queue=queue.Queue(),
+            resurrector_event=threading.Event(),
+        )
         self._resurrector_thread = _ResurrectorThread(
-            name=f'{self.name}ResurrectorThread',
-            executor=self,
+            name=f'{name}ResurrectorThread',
+            pool_state=self.state,
         )
         self._resurrector_thread.start()
 
@@ -136,15 +148,17 @@ class UnboundedThreadPoolExecutor(Executor):
             raise TypeError('submit expected at least 1 positional argument, '
                             'got %d' % (len(args) - 1))
         future = Future()
-        self._queue.put(TaskItem(future, fn, args, kwargs))
-        self._resurrector_event.set()
+        self.state.queue.put(TaskItem(future, fn, args, kwargs))
+        self.state.resurrector_event.set()
         return future
 
+    def __del__(self):
+        self.shutdown(wait=False)
+
     def shutdown(self, wait=True):
-        self._shutting_down = True
-        for _ in range(self.active_count):
-            self._queue.put(DieTask)
-        self._resurrector_event.set()
+        self.state.shutting_down = True
+        self.state.queue.put(DieTask)
+        self.state.resurrector_event.set()
 
         if wait:
             self._resurrector_thread.join()
